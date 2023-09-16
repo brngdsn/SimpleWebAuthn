@@ -168,7 +168,7 @@
           elemError.innerHTML = '';
           elemDebug.innerHTML = '';
 
-          const resp = await fetch('/generate-registration-options');
+          const resp = await fetch(`/generate-registration-options?username=eg_username${Math.floor(Math.random() * 10000)}`);
 
           let attResp;
           try {
@@ -223,7 +223,7 @@
           elemError.innerHTML = '';
           elemDebug.innerHTML = '';
 
-          const resp = await fetch('/generate-authentication-options');
+          const resp = await fetch('/generate-authentication-options?username=eg_username3091');
 
           let asseResp;
           try {

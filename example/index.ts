@@ -9,11 +9,18 @@ import http from 'http';
 import fs from 'fs';
 
 import express from 'express';
-import session from 'express-session';
+import session, { SessionData } from 'express-session';
 import memoryStore from 'memorystore';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+declare module 'express-session' {
+  interface SessionData {
+    loggedInUserId?: string;
+    currentChallenge?: string;
+  }
+}
 
 import {
   // Authentication
@@ -39,7 +46,15 @@ import type {
   RegistrationResponseJSON,
 } from '@simplewebauthn/typescript-types';
 
-import { LoggedInUser } from './example-server';
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT || '5432', 10),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+});
 
 const app = express();
 const MemoryStore = memoryStore(session);
@@ -99,63 +114,57 @@ export let expectedOrigin = '';
  *
  * Here, the example server assumes the following user has completed login:
  */
-const loggedInUserId = 'internalUserId';
-
-const inMemoryUserDeviceDB: { [loggedInUserId: string]: LoggedInUser } = {
-  [loggedInUserId]: {
-    id: loggedInUserId,
-    username: `user@${rpID}`,
-    devices: [],
-  },
-};
+// const loggedInUserId = 'internalUserId';
 
 /**
  * Registration (a.k.a. "Registration")
  */
 app.get('/generate-registration-options', async (req, res) => {
-  const user = inMemoryUserDeviceDB[loggedInUserId];
+  const username = req.query.username; // Allow users to pick their username
 
-  const {
-    /**
-     * The username can be a human-readable name, email, etc... as it is intended only for display.
-     */
-    username,
-    devices,
-  } = user;
+  if (!username) {
+    return res.status(400).send({ error: 'Username is required' });
+  }
+
+  // Fetch user from the database using the provided username
+  const existingUserResult = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  const existingUser = existingUserResult.rows[0];
+
+  if (existingUser) {
+    return res.status(404).send({ error: 'Username already in use' });
+  }
+
+  await pool.query('INSERT INTO users (username) values ($1)', [username]);
+  const userResult = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  const user = userResult.rows[0];
+
+  req.session.loggedInUserId = user.id;
+
+  // Fetch the devices associated with the user from the database
+  const devicesResult = await pool.query('SELECT * FROM devices WHERE user_id = $1', [user.id]);
+  const devices = devicesResult.rows;
 
   const opts: GenerateRegistrationOptionsOpts = {
     rpName: 'SimpleWebAuthn Example',
     rpID,
-    userID: loggedInUserId,
-    userName: username,
+    userID: user.id,
+    userName: user.username,
     timeout: 60000,
     attestationType: 'none',
-    /**
-     * Passing in a user's list of already-registered authenticator IDs here prevents users from
-     * registering the same device multiple times. The authenticator will simply throw an error in
-     * the browser if it's asked to perform registration when one of these ID's already resides
-     * on it.
-     */
     excludeCredentials: devices.map((dev) => ({
       id: dev.credentialID,
       type: 'public-key',
-      transports: dev.transports,
+      transports: JSON.parse(dev.transports), // Assuming transports is stored as a JSON string
     })),
     authenticatorSelection: {
       residentKey: 'discouraged',
     },
-    /**
-     * Support the two most common algorithms: ES256, and RS256
-     */
     supportedAlgorithmIDs: [-7, -257],
   };
 
   const options = await generateRegistrationOptions(opts);
 
-  /**
-   * The server needs to temporarily remember this value for verification, so don't lose it until
-   * after you verify an authenticator response.
-   */
+  // The server needs to temporarily remember this value for verification
   req.session.currentChallenge = options.challenge;
 
   res.send(options);
@@ -164,9 +173,22 @@ app.get('/generate-registration-options', async (req, res) => {
 app.post('/verify-registration', async (req, res) => {
   const body: RegistrationResponseJSON = req.body;
 
-  const user = inMemoryUserDeviceDB[loggedInUserId];
-
   const expectedChallenge = req.session.currentChallenge;
+
+  // Fetch the loggedInUserId from the session
+  const loggedInUserId = req.session.loggedInUserId;
+
+  if (!loggedInUserId) {
+    return res.status(400).send({ error: 'User is not logged in' });
+  }
+
+  // Fetch the user from the database using the loggedInUserId
+  const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [loggedInUserId]);
+  const user = userResult.rows[0];
+
+  if (!user) {
+    return res.status(404).send({ error: 'User not found' });
+  }
 
   let verification: VerifiedRegistrationResponse;
   try {
@@ -189,21 +211,15 @@ app.post('/verify-registration', async (req, res) => {
   if (verified && registrationInfo) {
     const { credentialPublicKey, credentialID, counter } = registrationInfo;
 
-    const existingDevice = user.devices.find((device) =>
-      isoUint8Array.areEqual(device.credentialID, credentialID)
-    );
+    // Check if the device already exists in the database for the user
+    const existingDeviceResult = await pool.query('SELECT * FROM devices WHERE credentialid = $1 AND user_id = $2', [credentialID, user.id]);
 
-    if (!existingDevice) {
-      /**
-       * Add the returned device to the user's list of devices
-       */
-      const newDevice: AuthenticatorDevice = {
-        credentialPublicKey,
-        credentialID,
-        counter,
-        transports: body.response.transports,
-      };
-      user.devices.push(newDevice);
+    if (!existingDeviceResult.rows.length) {
+      // Insert the new device into the database
+      await pool.query(
+        'INSERT INTO devices (user_id, credentialpublickey, credentialid, counter, transports) VALUES ($1, $2, $3, $4, $5)',
+        [user.id, credentialPublicKey, credentialID, counter, JSON.stringify(body.response.transports)]
+      );
     }
   }
 
@@ -216,15 +232,33 @@ app.post('/verify-registration', async (req, res) => {
  * Login (a.k.a. "Authentication")
  */
 app.get('/generate-authentication-options', async (req, res) => {
-  // You need to know the user by this point
-  const user = inMemoryUserDeviceDB[loggedInUserId];
+  const username = req.query.username; // Allow users to pick their username
+
+  if (!username) {
+    return res.status(400).send({ error: 'Username is required' });
+  }
+
+  // Fetch user from the database using the provided username
+  const userResult = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  const user = userResult.rows[0];
+
+  if (!user) {
+    return res.status(404).send({ error: 'User not found' });
+  }
+
+  // Set the loggedInUserId in the session
+  req.session.loggedInUserId = user.id;
+
+  // Fetch the devices associated with the user from the database
+  const devicesResult = await pool.query('SELECT * FROM devices WHERE user_id = $1', [user.id]);
+  const devices = devicesResult.rows;
 
   const opts: GenerateAuthenticationOptionsOpts = {
     timeout: 60000,
-    allowCredentials: user.devices.map((dev) => ({
-      id: dev.credentialID,
+    allowCredentials: devices.map((dev) => ({
+      id: dev.credentialid,
       type: 'public-key',
-      transports: dev.transports,
+      transports: JSON.parse(dev.transports), // Assuming transports is stored as a JSON string
     })),
     userVerification: 'required',
     rpID,
@@ -232,10 +266,7 @@ app.get('/generate-authentication-options', async (req, res) => {
 
   const options = await generateAuthenticationOptions(opts);
 
-  /**
-   * The server needs to temporarily remember this value for verification, so don't lose it until
-   * after you verify an authenticator response.
-   */
+  // The server needs to temporarily remember this value for verification
   req.session.currentChallenge = options.challenge;
 
   res.send(options);
@@ -244,19 +275,21 @@ app.get('/generate-authentication-options', async (req, res) => {
 app.post('/verify-authentication', async (req, res) => {
   const body: AuthenticationResponseJSON = req.body;
 
-  const user = inMemoryUserDeviceDB[loggedInUserId];
-
   const expectedChallenge = req.session.currentChallenge;
 
-  let dbAuthenticator;
-  const bodyCredIDBuffer = isoBase64URL.toBuffer(body.rawId);
-  // "Query the DB" here for an authenticator matching `credentialID`
-  for (const dev of user.devices) {
-    if (isoUint8Array.areEqual(dev.credentialID, bodyCredIDBuffer)) {
-      dbAuthenticator = dev;
-      break;
-    }
+  // Fetch the loggedInUserId from the session
+  const loggedInUserId = req.session.loggedInUserId;
+
+  if (!loggedInUserId) {
+    return res.status(400).send({ error: 'User is not logged in' });
   }
+
+  // Convert the rawId from the request body to a buffer for comparison
+  const bodyCredIDBuffer = isoBase64URL.toBuffer(body.rawId);
+
+  // Fetch the device associated with the credential ID from the database
+  const deviceResult = await pool.query('SELECT * FROM devices WHERE credentialid = $1', [bodyCredIDBuffer]);
+  const dbAuthenticator = deviceResult.rows[0];
 
   if (!dbAuthenticator) {
     return res.status(400).send({
@@ -265,13 +298,14 @@ app.post('/verify-authentication', async (req, res) => {
   }
 
   let verification: VerifiedAuthenticationResponse;
+
   try {
     const opts: VerifyAuthenticationResponseOpts = {
       response: body,
       expectedChallenge: `${expectedChallenge}`,
       expectedOrigin,
       expectedRPID: rpID,
-      authenticator: dbAuthenticator,
+      authenticator: [dbAuthenticator].map((a) => ({ ...a, credentialPublicKey: a.credentialpublickey, credentialId: a.credentialid }))[0],
       requireUserVerification: true,
     };
     verification = await verifyAuthenticationResponse(opts);
@@ -285,7 +319,7 @@ app.post('/verify-authentication', async (req, res) => {
 
   if (verified) {
     // Update the authenticator's counter in the DB to the newest count in the authentication
-    dbAuthenticator.counter = authenticationInfo.newCounter;
+    await pool.query('UPDATE devices SET counter = $1 WHERE credentialID = $2', [authenticationInfo.newCounter, bodyCredIDBuffer]);
   }
 
   req.session.currentChallenge = undefined;
