@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "db:create": "psql -v password_variable=$PG_PASSWORD -f sql/create-db.sql",
     "start": "nodemon index.ts",
     "build": "tsc"
   },
