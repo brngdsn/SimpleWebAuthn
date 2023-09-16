@@ -9,7 +9,7 @@ import http from 'http';
 import fs from 'fs';
 
 import express from 'express';
-import session, { SessionData } from 'express-session';
+import session from 'express-session';
 import memoryStore from 'memorystore';
 import dotenv from 'dotenv';
 
@@ -29,9 +29,6 @@ import {
   generateRegistrationOptions,
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
-} from '@simplewebauthn/server';
-import { isoBase64URL, isoUint8Array } from '@simplewebauthn/server/helpers';
-import type {
   GenerateAuthenticationOptionsOpts,
   GenerateRegistrationOptionsOpts,
   VerifiedAuthenticationResponse,
@@ -39,6 +36,8 @@ import type {
   VerifyAuthenticationResponseOpts,
   VerifyRegistrationResponseOpts,
 } from '@simplewebauthn/server';
+
+import { isoBase64URL, isoUint8Array } from '@simplewebauthn/server/helpers';
 
 import type {
   AuthenticationResponseJSON,
@@ -62,14 +61,15 @@ const MemoryStore = memoryStore(session);
 const {
   ENABLE_CONFORMANCE,
   ENABLE_HTTPS,
-  RP_ID = 'localhost',
+  RP_ID,
+  SESSION_SECRET,
 } = process.env;
 
 app.use(express.static('./public/'));
 app.use(express.json());
 app.use(
   session({
-    secret: 'secret123',
+    secret: SESSION_SECRET || 'secret1234',
     saveUninitialized: true,
     resave: false,
     cookie: {
@@ -100,7 +100,7 @@ if (ENABLE_CONFORMANCE === 'true') {
  * RP ID represents the "scope" of websites on which a authenticator should be usable. The Origin
  * represents the expected URL from which registration or authentication occurs.
  */
-export const rpID = RP_ID;
+export const rpID = RP_ID || 'localhost';
 // This value is set at the bottom of page as part of server initialization (the empty string is
 // to appease TypeScript until we determine the expected origin based on whether or not HTTPS
 // support is enabled)
@@ -145,7 +145,7 @@ app.get('/generate-registration-options', async (req, res) => {
   const devices = devicesResult.rows;
 
   const opts: GenerateRegistrationOptionsOpts = {
-    rpName: 'SimpleWebAuthn Example',
+    rpName: 'ooo-very',
     rpID,
     userID: user.id,
     userName: user.username,
