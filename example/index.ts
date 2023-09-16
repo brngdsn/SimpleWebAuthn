@@ -7,7 +7,8 @@
 import https from 'https';
 import http from 'http';
 import fs from 'fs';
-
+import { Pool } from 'pg';
+import { ParsedQs } from 'qs';
 import express from 'express';
 import session from 'express-session';
 import memoryStore from 'memorystore';
@@ -19,6 +20,7 @@ declare module 'express-session' {
   interface SessionData {
     loggedInUserId?: string;
     currentChallenge?: string;
+    inviteToken?: string | ParsedQs | string[] | ParsedQs[];
   }
 }
 
@@ -45,8 +47,6 @@ import type {
   RegistrationResponseJSON,
 } from '@simplewebauthn/typescript-types';
 
-import { Pool } from 'pg';
-
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: parseInt(process.env.DB_PORT || '5432', 10),
@@ -63,7 +63,10 @@ const {
   ENABLE_HTTPS,
   RP_ID,
   SESSION_SECRET,
+  INVITE_TOKEN_SECRET,
 } = process.env;
+
+import { generateToken, verifyToken } from './helpers'
 
 app.use(express.static('./public/'));
 app.use(express.json());
@@ -114,16 +117,24 @@ export let expectedOrigin = '';
  *
  * Here, the example server assumes the following user has completed login:
  */
-// const loggedInUserId = 'internalUserId';
 
 /**
  * Registration (a.k.a. "Registration")
  */
 app.get('/generate-registration-options', async (req, res) => {
   const username = req.query.username; // Allow users to pick their username
+  const inviteToken = req.query.inviteToken; // Get the invite token from the query
 
-  if (!username) {
-    return res.status(400).send({ error: 'Username is required' });
+  if (!username || !inviteToken) {
+    return res.status(400).send({ error: 'Username and invite token are required' });
+  }
+
+  // Verify the invite token
+  const tokenResult = await pool.query('SELECT * FROM invite_tokens WHERE token = $1 AND used = FALSE', [inviteToken]);
+  const token = tokenResult.rows[0];
+
+  if (!token) {
+    return res.status(400).send({ error: 'Invalid or already used invite token' });
   }
 
   // Fetch user from the database using the provided username
@@ -166,6 +177,7 @@ app.get('/generate-registration-options', async (req, res) => {
 
   // The server needs to temporarily remember this value for verification
   req.session.currentChallenge = options.challenge;
+  req.session.inviteToken = inviteToken;
 
   res.send(options);
 });
@@ -177,6 +189,7 @@ app.post('/verify-registration', async (req, res) => {
 
   // Fetch the loggedInUserId from the session
   const loggedInUserId = req.session.loggedInUserId;
+  const inviteToken = req.session.inviteToken; // Get the invite token from the query
 
   if (!loggedInUserId) {
     return res.status(400).send({ error: 'User is not logged in' });
@@ -221,9 +234,13 @@ app.post('/verify-registration', async (req, res) => {
         [user.id, credentialPublicKey, credentialID, counter, JSON.stringify(body.response.transports)]
       );
     }
+
+    // Mark the token as used
+    await pool.query('UPDATE invite_tokens SET used = TRUE WHERE token = $1', [inviteToken]);
   }
 
   req.session.currentChallenge = undefined;
+  req.session.inviteToken = undefined;
 
   res.send({ verified });
 });
